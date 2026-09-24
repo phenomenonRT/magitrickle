@@ -1,0 +1,152 @@
+name: Build and Package OPKG
+
+on:
+  push:
+    branches-ignore:
+      - 'refs/tags/*'
+    paths-ignore:
+      - '**.md'
+      - '.github/**'
+      - '!.github/workflows/build.yml'
+  release:
+    types: [published]
+
+jobs:
+  prepare:
+    name: Prepare build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      configs: ${{ steps.collect.outputs.configs }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build config matrix
+        id: collect
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+
+          configs = sorted(Path("config").glob("*/*.config"))
+
+          if not configs:
+              raise SystemExit("No build configs found")
+
+          matrix = [
+              {
+                  "config": config.as_posix(),
+                  "name": config.stem,
+              }
+              for config in configs
+          ]
+
+          print(f"configs={json.dumps(matrix, separators=(',', ':'))}")
+          PY
+
+  build:
+    name: Build packages (${{ matrix.name }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.configs) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.JS
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: '1.23'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fakeroot upx meson ninja-build pkg-config libssl-dev zlib1g-dev libzstd-dev
+
+      - name: Building apk-tools
+        run: |
+          git clone --depth 1 --branch v3.0.7 https://github.com/alpinelinux/apk-tools.git /tmp/apk-tools
+          cd /tmp/apk-tools
+          meson setup build -Dpython=disabled -Dtests=disabled -Ddocs=disabled
+          ninja -C build
+          sudo ninja -C build install
+          sudo ldconfig
+
+      - name: Build and package
+        env:
+          BUILD_KEY_APK_SEC_CONTENT: ${{ secrets.BUILD_KEY_APK_SEC }}
+        run: |
+          eval export $(make _return_export_dynamic_env);
+          cp "${{ matrix.config }}" .config
+          if [ -n "$BUILD_KEY_APK_SEC_CONTENT" ]; then
+            KEY_FILE=$(mktemp)
+            printf '%s' "$BUILD_KEY_APK_SEC_CONTENT" > "$KEY_FILE"
+            export BUILD_KEY_APK_SEC="$KEY_FILE"
+          fi
+          make
+
+      - name: Collect package files
+        id: package_outputs
+        run: |
+          mapfile -t packages < <(
+            find .build -maxdepth 1 -type f \( -name "magitrickle_*.ipk" -o -name "magitrickle_*.apk" \) | sort
+          )
+
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo "No package files found" >&2
+            exit 1
+          fi
+
+          if [ "${#packages[@]}" -gt 2 ]; then
+            echo "Expected at most 2 package files, found ${#packages[@]}" >&2
+            exit 1
+          fi
+
+          for i in "${!packages[@]}"; do
+            index=$((i + 1))
+            file="${packages[$i]}"
+            echo "package_${index}_path=${file}" >> "$GITHUB_OUTPUT"
+            echo "package_${index}_name=$(basename "${file}")" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Upload package artifact 1
+        if: ${{ github.event_name != 'release' && steps.package_outputs.outputs.package_1_path != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package_outputs.outputs.package_1_name }}
+          path: ${{ steps.package_outputs.outputs.package_1_path }}
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload package artifact 2
+        if: ${{ github.event_name != 'release' && steps.package_outputs.outputs.package_2_path != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package_outputs.outputs.package_2_name }}
+          path: ${{ steps.package_outputs.outputs.package_2_path }}
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload package asset 1 to release
+        if: ${{ github.event_name == 'release' && steps.package_outputs.outputs.package_1_path != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package_outputs.outputs.package_1_path }}
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Upload package asset 2 to release
+        if: ${{ github.event_name == 'release' && steps.package_outputs.outputs.package_2_path != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package_outputs.outputs.package_2_path }}
+          token: ${{ secrets.RELEASE_TOKEN }}

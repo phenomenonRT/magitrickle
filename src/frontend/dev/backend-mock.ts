@@ -1,0 +1,194 @@
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import { serveStatic } from "hono/deno";
+import { logger } from "hono/logger";
+import { streamSSE } from "hono/streaming";
+
+import type { Interfaces } from "../src/types.ts";
+
+const API_BASE = "/api/v1";
+
+const INTERFACES: Interfaces = {
+  interfaces: [{ id: "nwg0" }, { id: "longinterf" }, { id: "eth1" }, { id: "wg0", name: "WireGuard Interface" }],
+};
+
+const DATA = JSON.parse(Deno.readTextFileSync("./dev/groups.json"));
+const SUBSCRIPTIONS = [
+  {
+    id: "a1b2c3d4",
+    name: "Bad Bad Services",
+    interface: "blackhole",
+    enable: true,
+    url: "https://services.should.be.blocked.com",
+    lastUpdate: Math.floor(Date.now() / 1000),
+    interval: 86400,
+    rules: [
+      { enable: true, id: "11223344", rule: "google.com", type: "domain" },
+      { enable: true, id: "55667788", rule: "facebook.com", type: "domain" },
+    ],
+  },
+];
+
+function randomLogLine() {
+  function randomIndex(array: any[]) {
+    return array[Math.round(Math.random() * (array.length - 1))];
+  }
+  function randomIP(): string {
+    return `${Math.round(Math.random() * 255)}.${Math.round(Math.random() * 255)}.${Math.round(
+      Math.random() * 255,
+    )}.${Math.round(Math.random() * 255)}`;
+  }
+
+  const level = randomIndex(["trace", "debug", "info", "warn", "error", "fatal", "panic"]);
+
+  return {
+    time: new Date().toISOString(),
+    level: level,
+    error: ["error", "fatal", "panic"].includes(level) ? "random error" : undefined,
+    message: ["error", "fatal", "panic"].includes(level)
+      ? "error message"
+      : `group: ${randomIndex(DATA.groups).name}, ip: ${randomIP()} > int: ${randomIndex(
+          INTERFACES.interfaces.map((item) => item.id),
+        )}`,
+  };
+}
+
+let sse_id = 0;
+
+const PORT = 6969;
+const STATIC_TOKEN = "magitrickle_mock_token_2026";
+const AUTH_ENABLED = true;
+
+const app = new Hono();
+
+app.use(logger());
+app.use(cors());
+
+// Auth Middleware
+app.use(`${API_BASE}/*`, async (c, next) => {
+  if (c.req.path === `${API_BASE}/auth` || !AUTH_ENABLED) {
+    await next();
+    return;
+  }
+
+  const authHeader = c.req.header("Authorization");
+  if (authHeader !== `Bearer ${STATIC_TOKEN}` && authHeader !== `Bearer disabled`) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  await next();
+});
+
+app.get(`${API_BASE}/auth`, async (c) => {
+  return c.json({ enabled: AUTH_ENABLED }, 200);
+});
+
+app.post(`${API_BASE}/auth`, async (c) => {
+  const body = await c.req.json();
+  if (body.login === "root" && body.password === "keenetic") {
+    return c.json({ token: STATIC_TOKEN });
+  }
+  return c.json({ error: "Invalid credentials" }, 403);
+});
+
+app.get(`${API_BASE}/groups`, (c) => c.json(DATA));
+app.put(`${API_BASE}/groups`, async (c) => {
+  console.debug("recieved", (await c.req.json())?.groups?.length, "groups");
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+  if (Math.random() < 0.5) {
+    return c.json({ error: "random error" }, 500);
+  }
+  return c.json({ status: "ok" });
+});
+
+app.get(`${API_BASE}/subscriptions`, (c) => c.json({ subscriptions: SUBSCRIPTIONS }));
+
+app.put(`${API_BASE}/subscriptions`, async (c) => {
+  console.debug("recieved", (await c.req.json())?.subscriptions?.length, "subscriptions");
+  const body = await c.req.json();
+  SUBSCRIPTIONS.splice(0, SUBSCRIPTIONS.length, ...body.subscriptions);
+  return c.json({ status: "ok" });
+});
+
+app.post(`${API_BASE}/subscriptions`, async (c) => {
+  const body = await c.req.json();
+  console.debug("created subscription", body);
+  SUBSCRIPTIONS.unshift(body);
+  return c.json({ status: "ok" });
+});
+
+app.get(`${API_BASE}/subscriptions/rules`, (c) => {
+  if (Math.random() < 0.5) {
+    return c.json({ error: "random error" }, 500);
+  }
+  const url = c.req.query("url");
+
+  const count = Math.floor(Math.random() * 50) + 5;
+  const rules = Array.from({ length: count }).map(() => ({
+    enable: true,
+    id: Math.random().toString(16).substring(2, 10),
+    rule: `mock.rule.${Math.random().toString(36).substring(7)}.com`,
+    type: Math.random() < 0.5 ? "namespace" : "domain",
+  }));
+
+  return c.json({ rules });
+});
+
+app.post(`${API_BASE}/subscriptions/:id/sync`, async (c) => {
+  const id = c.req.param("id");
+  const body = await c.req.json();
+  console.debug("updated subscription, syncing rules", id, body);
+  const index = SUBSCRIPTIONS.findIndex((s) => s.id === id);
+
+  if (index !== -1) {
+    const count = Math.floor(Math.random() * 70) + 5;
+    const rules = Array.from({ length: count }).map(() => ({
+      enable: true,
+      id: Math.random().toString(16).substring(2, 10),
+      rule: `mock.rule.${Math.random().toString(36).substring(7)}.com`,
+      type: Math.random() < 0.5 ? "namespace" : "domain",
+    }));
+
+    const updatedSub = {
+      ...SUBSCRIPTIONS[index],
+      ...body,
+      rules: rules,
+      lastUpdate: Math.floor(Date.now() / 1000),
+    };
+
+    SUBSCRIPTIONS[index] = updatedSub;
+    return c.json({ rules: updatedSub.rules, lastUpdate: updatedSub.lastUpdate });
+  }
+  return c.json({ error: "Subscription not found" }, 404);
+});
+
+app.delete(`${API_BASE}/subscriptions/:id`, async (c) => {
+  const id = c.req.param("id");
+  console.debug("deleting subscription", id);
+  const index = SUBSCRIPTIONS.findIndex((s) => s.id === id);
+  if (index !== -1) {
+    SUBSCRIPTIONS.splice(index, 1);
+    return c.json({ status: "ok" });
+  }
+  return c.json({ error: "Subscription not found" }, 404);
+});
+
+app.get(`${API_BASE}/system/interfaces`, (c) => c.json(INTERFACES));
+app.get(`${API_BASE}/logs`, async (c) => {
+  return streamSSE(c, async (stream) => {
+    while (true) {
+      await stream.writeSSE({
+        data: JSON.stringify(randomLogLine()),
+        id: String(sse_id++),
+      });
+      await stream.sleep(Math.round(Math.random() * 1000));
+    }
+  });
+});
+
+app.get("*", serveStatic({ root: "./dist" }));
+
+Deno.serve(
+  { port: PORT, onListen: () => console.log(`running mock server on port ${PORT}...`) },
+  app.fetch,
+);

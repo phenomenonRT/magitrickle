@@ -1,0 +1,23 @@
+package models
+
+import "magitrickle/utils/intID"
+
+type SubscriptionRule struct {
+	ID     intID.ID `yaml:"id"`
+	Rule   string   `yaml:"rule"`
+	Type   string   `yaml:"type"`
+	Enable bool     `yaml:"enable"`
+}
+
+type Subscription struct {
+	ID                 intID.ID            `yaml:"id"`
+	Name               string              `yaml:"name"`
+	Interface          string              `yaml:"interface"`
+	FallbackInterfaces []string            `yaml:"fallback_interfaces,omitempty"`
+	Enable             bool                `yaml:"enable"`
+	URL                string              `yaml:"url"`
+	Interval           uint32              `yaml:"interval"`
+	LastUpdate         uint32              `yaml:"last_update"`
+	LastCheck          uint32              `yaml:"-"`
+	Rules              []*SubscriptionRule `yaml:"rules"`
+}
